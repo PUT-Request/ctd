@@ -65,6 +65,9 @@ type Resources struct {
 	Nofile      *uint64 `json:"nofile,omitempty"       yaml:"nofile,omitempty"`
 	MemoryBytes *uint64 `json:"memory_bytes,omitempty" yaml:"memory_bytes,omitempty"` // RLIMIT_AS
 	Core        *uint64 `json:"core,omitempty"         yaml:"core,omitempty"`
+	// DiskMaxBytes caps the container's disk footprint (admission gate
+	// before every exec; 0 = unlimited).
+	DiskMaxBytes *uint64 `json:"disk_max_bytes,omitempty" yaml:"disk_max_bytes,omitempty"`
 }
 
 // NetworkSpec gates all socket operations (Seatbelt default: deny).
@@ -408,6 +411,8 @@ func (s *Spec) Set(kv string) error {
 				s.Resources.Nofile = &n
 			case "memory_bytes":
 				s.Resources.MemoryBytes = &n
+			case "disk_max_bytes":
+				s.Resources.DiskMaxBytes = &n
 			case "core":
 				s.Resources.Core = &n
 			default:
@@ -484,6 +489,7 @@ resources:
   cpu_seconds: 1800
   fsize_bytes: 1073741824
   memory_bytes: 2147483648
+  disk_max_bytes: 2147483648   # max disk footprint (0 = unlimited)
   nproc: 256
   nofile: 512
   core: 0

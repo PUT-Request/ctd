@@ -1,45 +1,62 @@
 // ctd — native macOS shell containers.
+//
+// Two roles live in this binary:
+//
+//   - `ctd daemon`  — the privileged long-lived daemon: owns all container
+//     state, serves the HTTP JSON API and the local control socket.
+//   - everything else — a thin client that talks to the daemon over the
+//     socket (sudo re-exec when needed). `ctd rpc` bridges stdio JSON-RPC
+//     to the daemon socket.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
 	"ctd/internal/api"
 	"ctd/internal/core"
+	"ctd/internal/daemon"
 )
 
 const usage = `ctd — native macOS shell containers (chroot + APFS CoW + Seatbelt)
 
+The privileged daemon (` + "`sudo ctd daemon`" + `) owns all container state; every
+other command is a client that talks to it. Keep the daemon terminal open.
+
 usage: ctd <command> [args]
 
-  doctor                     run environment probes (read-only)
+  daemon [--listen A] [--socket P]
+                          run the daemon in the foreground (default
+                          listen 127.0.0.1:7399, socket /opt/ctd/ctd.sock)
+  doctor                     environment probes (JSON, via daemon)
   base prepare [--force]     build shared base shadow (once, idempotent)
-  create <name> [--ttl N]    create container (TTL seconds, 0=never)
+  create <name> [--ttl N] [--set k=v ...]
+                          create container (TTL seconds, 0=never, default 3600)
   ps                         list containers
-  run <name> <cmd...>        run command (interactive, inherits tty)
+  run <name> <cmd...>        run command (streamed, stdin forwarded)
   exec <name> <cmd...>       run command (captures stdout/stderr)
   exec --json <name> <cmd..> run command, print JSON result
   shell [name]               interactive shell (default container: default)
   deploy -f tpl.yaml         create from YAML template
                              [--name n] [--set network.allow=true]
-  template new [file]        write an example template
-  template validate <file>   validate + show resolved spec
+  template new [file]        write an example template (local)
+  template validate <file>   validate + show resolved spec (local)
   inspect <name>             container state + effective spec (JSON)
   audit <name>               live security probe suite (JSON, exit 1 on fail)
   bootstrap <name>           re-run template bootstrapping in a container
   once [-f t.yaml] [--rm] <cmd...>   one-shot: create if needed → run → optional cleanup
   destroy <name>             detach + delete container
   gc                         destroy expired containers
-  serve [--listen A]         HTTP JSON API on A (default 127.0.0.1:7399) + stdio RPC
-  rpc                        stdio JSON-RPC (newline-delimited JSON on stdin/stdout)
+  rpc                        stdio JSON-RPC proxy to the daemon socket
   token                      print the API bearer token
 
-HTTP API (Authorization: Bearer <token>, or ?token=):
+HTTP API (served by the daemon; Authorization: Bearer <token>, or ?token=):
   GET    /v1/ping                     health
   GET    /v1/doctor                   probes
   POST   /v1/base/prepare             {"force":false}
@@ -51,27 +68,31 @@ HTTP API (Authorization: Bearer <token>, or ?token=):
   POST   /v1/rpc                      {"method":"container.list","params":{}}
   POST   /v1/gc
 
-stdio JSON-RPC (one JSON object per line):
-  > {"id":"1","method":"container.create","params":{"name":"demo"}}
+socket JSON-RPC (one JSON object per line, via ` + "`ctd rpc`" + `):
+  > {"id":"1","method":"container.list","params":{}}
   < {"id":"1","ok":true,"result":{...}}
-  methods: ping, doctor, base.prepare, container.create, container.list,
-           container.inspect, container.destroy, container.gc, container.exec
+  methods: ping, doctor, base.prepare, container.create, container.deploy,
+           container.list, container.inspect, container.destroy, container.gc,
+           container.exec, container.once, container.bootstrap,
+           container.audit, container.audit, template.validate
 
 examples:
-  sudo ctd base prepare
+  sudo ctd daemon                    # terminal 1: daemon (keep open)
+  sudo ctd base prepare              # terminal 2
   sudo ctd create demo --ttl 3600
-  ctd run demo /bin/bash -c 'echo hi | /usr/bin/wc -w'
-  ctd exec --json demo /usr/bin/uname -a
-  curl -s -H "Authorization: Bearer $(ctd token)" \
+  sudo ctd run demo /bin/bash -c 'echo hi | /usr/bin/wc -w'
+  sudo ctd exec --json demo /usr/bin/uname -a
+  curl -s -H "Authorization: Bearer $(sudo ctd token)" \
        -d '{"command":["/bin/ls","/"]}' localhost:7399/v1/containers/demo/exec
-  echo '{"id":"1","method":"container.list"}' | ctd rpc
+  echo '{"id":"1","method":"container.list"}' | sudo ctd rpc
 `
 
-// subcommands that need root
+// subcommands that need root (daemon socket is root-owned)
 var privileged = map[string]bool{
-	"base": true, "create": true, "destroy": true, "gc": true, "deploy": true,
-	"serve": true, "run": true, "exec": true, "shell": true, "token": true, "once": true,
-	"audit": true, "inspect": true, "bootstrap": true,
+	"daemon": true, "base": true, "create": true, "destroy": true, "gc": true,
+	"deploy": true, "run": true, "exec": true, "shell": true, "token": true,
+	"once": true, "audit": true, "inspect": true, "bootstrap": true,
+	"doctor": true, "ps": true, "list": true, "rpc": true,
 }
 
 func main() {
@@ -82,9 +103,14 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
-	// internal stage, runs under sandbox-exec
+	// internal stage, runs under sandbox-exec inside the daemon's exec
 	if cmd == "__inner" {
 		os.Exit(core.Inner(args))
+	}
+
+	// local commands: pure file ops, no daemon needed
+	if cmd == "template" {
+		os.Exit(cmdTemplate(args))
 	}
 
 	if privileged[cmd] && os.Geteuid() != 0 {
@@ -94,8 +120,25 @@ func main() {
 	switch cmd {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
+	case "daemon":
+		listen, socket := "127.0.0.1:7399", api.SocketPath
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--listen" && i+1 < len(args) {
+				listen = args[i+1]
+				i++
+			} else if args[i] == "--socket" && i+1 < len(args) {
+				socket = args[i+1]
+				i++
+			}
+		}
+		if err := daemon.Run(listen, socket); err != nil {
+			fatal(err)
+		}
 	case "doctor":
-		rep := core.Doctor()
+		var rep core.DoctorReport
+		if err := callPrint("doctor", nil, &rep); err != nil {
+			fatal(err)
+		}
 		printJSON(rep)
 		if !rep.OK {
 			os.Exit(1)
@@ -104,9 +147,8 @@ func main() {
 		if len(args) == 0 || args[0] != "prepare" {
 			fatal(fmt.Errorf("usage: ctd base prepare [--force]"))
 		}
-		force := hasFlag(args[1:], "--force")
-		m, err := core.PrepareBase(force)
-		if err != nil {
+		var m core.Manifest
+		if err := callPrint("base.prepare", map[string]any{"force": hasFlag(args[1:], "--force")}, &m); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("base ready: %d tools re-signed, tree %s\n",
@@ -115,42 +157,43 @@ func main() {
 			fmt.Printf("not present in image (skipped): %s\n", strings.Join(m.ToolsMissing, ", "))
 		}
 	case "create":
-		name, rest := "", args
-		ttl := 0
-		for i := 0; i < len(rest); i++ {
-			if rest[i] == "--ttl" && i+1 < len(rest) {
-				fmt.Sscanf(rest[i+1], "%d", &ttl)
+		name, ttl := "", 0
+		var sets []string
+		for i := 0; i < len(args); i++ {
+			switch {
+			case args[i] == "--ttl" && i+1 < len(args):
+				fmt.Sscanf(args[i+1], "%d", &ttl)
 				i++
-			} else if name == "" && !strings.HasPrefix(rest[i], "-") {
-				name = rest[i]
+			case args[i] == "--set" && i+1 < len(args):
+				sets = append(sets, args[i+1])
+				i++
+			case name == "" && !strings.HasPrefix(args[i], "-"):
+				name = args[i]
 			}
 		}
 		if name == "" {
 			fatal(fmt.Errorf("usage: ctd create <name> [--ttl seconds] [--set key=value ...]"))
 		}
 		spec := core.DefaultSpec()
-		spec.TTLSeconds = ttl
-		if !hasFlag(args, "--ttl") {
-			spec.TTLSeconds = 3600 // default: expire in 1h (0 via --ttl 0)
+		spec.TTLSeconds = 3600 // default: expire in 1h (0 via --ttl 0)
+		if hasFlag(args, "--ttl") {
+			spec.TTLSeconds = ttl
 		}
-		for i := 0; i < len(args); i++ {
-			if args[i] == "--set" && i+1 < len(args) {
-				if err := spec.Set(args[i+1]); err != nil {
-					fatal(err)
-				}
-				i++
+		for _, kv := range sets {
+			if err := spec.Set(kv); err != nil {
+				fatal(err)
 			}
 		}
-		c, err := core.Create(name, spec)
-		if err != nil {
+		var c core.Container
+		if err := callPrint("container.deploy", map[string]any{"name": name, "spec": spec}, &c); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("container %q created (uid=%d, network=%v, shadow %s, allocated %s, ttl %s)\n",
 			c.Name, c.Uid, c.Network, core.HumanBytes(c.ShadowSize),
 			core.HumanBytes(c.ShadowUsed), ttlLabel(c.TTLSeconds))
 	case "ps", "list":
-		all, err := core.List()
-		if err != nil {
+		var all []*core.Container
+		if err := callPrint("container.list", nil, &all); err != nil {
 			fatal(err)
 		}
 		if hasFlag(args, "--json") {
@@ -161,7 +204,7 @@ func main() {
 			fmt.Println("no containers")
 			return
 		}
-		fmt.Printf("%-20s %-9s %-8s %-10s %s\n", "NAME", "STATE", "SHADOW", "ALLOC", "CREATED")
+		fmt.Printf("%-20s %-9s %-8s %-8s %-10s %s\n", "NAME", "STATE", "SHADOW", "DISK", "ALLOC", "CREATED")
 		for _, c := range all {
 			state := "detached"
 			if c.Attached {
@@ -170,15 +213,19 @@ func main() {
 			if c.Expired {
 				state = "expired"
 			}
-			fmt.Printf("%-20s %-9s %-8s %-10s %s ago\n", c.Name, state,
-				core.HumanBytes(c.ShadowSize), core.HumanBytes(c.ShadowUsed),
+			disk := core.HumanBytes(c.DiskUsed)
+			if c.DiskMax > 0 {
+				disk += "/" + core.HumanBytes(c.DiskMax)
+			}
+			fmt.Printf("%-20s %-9s %-8s %-8s %-10s %s ago\n", c.Name, state,
+				core.HumanBytes(c.ShadowSize), disk, core.HumanBytes(c.ShadowUsed),
 				core.RelTime(c.CreatedAt))
 		}
 	case "run":
 		if len(args) < 2 {
 			fatal(fmt.Errorf("usage: ctd run <name> <cmd...>"))
 		}
-		code, err := core.ExecInteractive("cli", args[0], args[1:], core.ExecOptions{})
+		code, err := api.Attach(args[0], args[1:], api.AttachOptions{})
 		if err != nil {
 			fatal(err)
 		}
@@ -189,39 +236,51 @@ func main() {
 		if len(rest) < 2 {
 			fatal(fmt.Errorf("usage: ctd exec [--json] <name> <cmd...>"))
 		}
-		// pipe stdin when not a terminal
 		var stdin string
 		if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 			b, _ := io.ReadAll(io.LimitReader(os.Stdin, 4<<20))
 			stdin = string(b)
 		}
-		res, err := core.Exec("cli", rest[0], rest[1:], core.ExecOptions{Stdin: stdin, Timeout: 5 * time.Minute})
+		raw, err := api.Call("container.exec", map[string]any{
+			"container":  rest[0],
+			"command":    rest[1:],
+			"stdin":      stdin,
+			"timeout_ms": (5 * time.Minute).Milliseconds(),
+		})
 		if err != nil {
 			fatal(err)
 		}
 		if jsonOut {
-			printJSON(res)
-		} else {
-			os.Stdout.WriteString(res.Stdout)
-			os.Stderr.WriteString(res.Stderr)
+			var v any
+			json.Unmarshal(raw, &v)
+			printJSON(v)
+			var er api.ExecResponse
+			json.Unmarshal(raw, &er)
+			os.Exit(er.ExitCode)
 		}
-		os.Exit(res.ExitCode)
+		var er api.ExecResponse
+		if err := json.Unmarshal(raw, &er); err != nil {
+			fatal(err)
+		}
+		os.Stdout.WriteString(er.Stdout)
+		os.Stderr.WriteString(er.Stderr)
+		os.Exit(er.ExitCode)
 	case "shell":
 		name := "default"
 		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 			name = args[0]
 		}
-		if _, err := core.Describe(name); err != nil {
+		if _, err := api.Call("container.inspect", map[string]any{"name": name}); err != nil {
 			// convenience: create default shell container on first use
 			if name == "default" {
-				if _, cErr := core.Create("default", core.DefaultSpec()); cErr == nil {
+				if _, cErr := api.Call("container.deploy", map[string]any{"name": "default"}); cErr == nil {
 					fmt.Fprintln(os.Stderr, "[ctd] created container \"default\" (no TTL)")
 				}
 			} else {
 				fatal(err)
 			}
 		}
-		code, err := core.ExecInteractive("cli", name, []string{"/bin/bash", "-i"}, core.ExecOptions{Cwd: "/Users/me"})
+		code, err := api.Attach(name, []string{"/bin/bash", "-i"}, api.AttachOptions{Cwd: "/Users/me"})
 		if err != nil {
 			fatal(err)
 		}
@@ -230,37 +289,10 @@ func main() {
 		if len(args) < 1 {
 			fatal(fmt.Errorf("usage: ctd destroy <name>"))
 		}
-		if err := core.Destroy(args[0]); err != nil {
+		if _, err := api.Call("container.destroy", map[string]any{"name": args[0]}); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("container %q destroyed\n", args[0])
-	case "template":
-		// ctd template new [file] | ctd template validate <file>
-		if len(args) == 0 || args[0] == "new" {
-			out := "/tmp/ctd-template.yaml"
-			if len(args) > 1 {
-				out = args[1]
-			} else if len(args) > 0 && args[0] != "new" {
-				out = args[0]
-			}
-			if _, err := os.Stat(out); err == nil {
-				fatal(fmt.Errorf("%s exists (refusing to overwrite)", out))
-			}
-			if err := os.WriteFile(out, []byte(core.ExampleTemplate()), 0o644); err != nil {
-				fatal(err)
-			}
-			fmt.Printf("wrote %s\n", out)
-			return
-		}
-		if args[0] != "validate" || len(args) < 2 {
-			fatal(fmt.Errorf("usage: ctd template new [file] | ctd template validate <file>"))
-		}
-		spec, err := core.ParseTemplate(args[1])
-		if err != nil {
-			fatal(err)
-		}
-		b, _ := json.MarshalIndent(spec, "", "  ")
-		fmt.Printf("valid ✓\n%s\n", b)
 	case "deploy":
 		// ctd deploy -f tpl.yaml [--name n] [--set k=v]...
 		file, name := "", ""
@@ -306,40 +338,43 @@ func main() {
 		if spec.Name == "" {
 			fatal(fmt.Errorf("template has no name: set name: or --name"))
 		}
-		c, err := core.Create(spec.Name, spec)
-		if err != nil {
+		var c core.Container
+		if err := callPrint("container.deploy", map[string]any{"name": spec.Name, "spec": spec}, &c); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("deployed %q (uid=%d, network=%v, shares=%d, writable=%v, ttl=%s)\n",
 			c.Name, c.Uid, c.Network, len(spec.Shares), spec.Writable, ttlLabel(c.TTLSeconds))
-		if len(spec.Shares) > 0 {
-			for _, sh := range spec.Shares {
-				mode := sh.Mode
-				if mode == "" {
-					mode = "rw"
-				}
-				fmt.Printf("  share: %s -> %s (%s, sync-at-exec)\n", sh.Host, sh.Container, mode)
+		for _, sh := range spec.Shares {
+			mode := sh.Mode
+			if mode == "" {
+				mode = "rw"
 			}
+			fmt.Printf("  share: %s -> %s (%s, sync-at-exec)\n", sh.Host, sh.Container, mode)
 		}
 	case "inspect":
 		if len(args) < 1 {
 			fatal(fmt.Errorf("usage: ctd inspect <name>"))
 		}
-		c, err := core.Describe(args[0])
+		raw, err := api.Call("container.inspect", map[string]any{"name": args[0]})
 		if err != nil {
 			fatal(err)
 		}
-		spec, _ := core.FullSpec(args[0])
-		printJSON(map[string]any{"container": c, "spec": spec})
+		var v any
+		json.Unmarshal(raw, &v)
+		printJSON(v)
 	case "audit":
 		if len(args) < 1 {
 			fatal(fmt.Errorf("usage: ctd audit <name>"))
 		}
-		rep, err := core.AuditContainer(args[0])
+		raw, err := api.Call("container.audit", map[string]any{"name": args[0]})
 		if err != nil {
 			fatal(err)
 		}
-		printJSON(rep)
+		var v any
+		json.Unmarshal(raw, &v)
+		printJSON(v)
+		var rep core.AuditReport
+		json.Unmarshal(raw, &rep)
 		if !rep.OK {
 			os.Exit(1)
 		}
@@ -377,26 +412,43 @@ func main() {
 		if len(argv) == 0 {
 			fatal(fmt.Errorf("usage: ctd once [-f tpl.yaml] [--name n] [--rm] [--json] [--timeout s] <cmd...>"))
 		}
+		params := map[string]any{
+			"command":    argv,
+			"rm":         rm,
+			"timeout_ms": int64(timeout) * 1000,
+		}
+		var spec *core.Spec
 		if file != "" {
-			if spec, err := core.ParseTemplate(file); err == nil && name == "" {
-				name = spec.Name
+			s, err := core.ParseTemplate(file)
+			if err != nil {
+				fatal(err)
+			}
+			spec = s
+			if name == "" {
+				name = s.Name
 			}
 		}
 		if name == "" {
 			fatal(fmt.Errorf("container name required (--name or template name:)"))
 		}
-		// piped stdin
-		var stdin string
+		params["name"] = name
+		if spec != nil {
+			params["spec"] = spec
+		}
 		if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice == 0 {
 			b, _ := io.ReadAll(io.LimitReader(os.Stdin, 4<<20))
-			stdin = string(b)
+			params["stdin"] = string(b)
 		}
-		res, err := core.Once(name, file, argv, core.ExecOptions{Stdin: stdin, Timeout: time.Duration(timeout) * time.Second}, rm)
+		raw, err := api.Call("container.once", params)
 		if err != nil {
 			fatal(err)
 		}
+		var res core.OnceResult
+		json.Unmarshal(raw, &res)
 		if jsonOut {
-			printJSON(res)
+			var v any
+			json.Unmarshal(raw, &v)
+			printJSON(v)
 		} else if res.Result != nil {
 			os.Stdout.WriteString(res.Result.Stdout)
 			os.Stderr.WriteString(res.Result.Stderr)
@@ -408,14 +460,14 @@ func main() {
 		if len(args) < 1 {
 			fatal(fmt.Errorf("usage: ctd bootstrap <name>"))
 		}
-		n, err := core.Bootstrap(args[0])
-		if err != nil {
+		var n int
+		if err := callPrint("container.bootstrap", map[string]any{"name": args[0]}, &n); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("bootstrapped %q (%d binary re-signed)\n", args[0], n)
 	case "gc":
-		destroyed, err := core.GC()
-		if err != nil {
+		var destroyed []string
+		if err := callPrint("container.gc", nil, &destroyed); err != nil {
 			fatal(err)
 		}
 		if len(destroyed) == 0 {
@@ -423,44 +475,74 @@ func main() {
 		} else {
 			fmt.Printf("destroyed: %s\n", strings.Join(destroyed, ", "))
 		}
-	case "serve":
-		listen := "127.0.0.1:7399"
-		token := ""
-		for i := 0; i < len(args); i++ {
-			if args[i] == "--listen" && i+1 < len(args) {
-				listen = args[i+1]
-				i++
-			} else if args[i] == "--token" && i+1 < len(args) {
-				token = args[i+1]
-				i++
-			}
+	case "rpc":
+		// stdio JSON-RPC proxy: pump lines between stdin/stdout and the socket.
+		c, err := api.Dial()
+		if err != nil {
+			fatal(err)
 		}
-		if token == "" {
-			token = api.LoadToken()
-		}
-		srv := &api.Server{Token: token, GCEnabled: true}
-		// Background GC every 60s.
+		defer c.Close()
 		go func() {
-			for range time.Tick(60 * time.Second) {
-				_, _ = core.GC()
+			_, _ = io.Copy(c, os.Stdin)
+			// stdin EOF: half-close so the daemon sees EOF and closes the
+			// session after flushing its responses.
+			if uc, ok := c.(*net.UnixConn); ok {
+				_ = uc.CloseWrite()
+			} else {
+				_ = c.Close()
 			}
 		}()
-		// HTTP + stdio on the same process: stdin lines served as RPC.
-		go func() { _ = srv.ServeStdio(os.Stdin, os.Stdout) }()
-		if err := srv.ServeHTTP(listen); err != nil {
-			fatal(err)
-		}
-	case "rpc":
-		srv := &api.Server{Token: ""} // stdio implies local trust
-		if err := srv.ServeStdio(os.Stdin, os.Stdout); err != nil {
-			fatal(err)
-		}
+		_, _ = io.Copy(os.Stdout, c)
 	case "token":
 		fmt.Println(api.LoadToken())
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
 	}
+}
+
+// cmdTemplate: template new | template validate — local file ops.
+func cmdTemplate(args []string) int {
+	if len(args) == 0 || args[0] == "new" {
+		out := "/tmp/ctd-template.yaml"
+		if len(args) > 1 {
+			out = args[1]
+		} else if len(args) > 0 && args[0] != "new" {
+			out = args[0]
+		}
+		if _, err := os.Stat(out); err == nil {
+			fatal(fmt.Errorf("%s exists (refusing to overwrite)", out))
+		}
+		if err := os.WriteFile(out, []byte(core.ExampleTemplate()), 0o644); err != nil {
+			fatal(err)
+		}
+		fmt.Printf("wrote %s\n", out)
+		return 0
+	}
+	if args[0] != "validate" || len(args) < 2 {
+		fatal(fmt.Errorf("usage: ctd template new [file] | ctd template validate <file>"))
+	}
+	spec, err := core.ParseTemplate(args[1])
+	if err != nil {
+		fatal(err)
+	}
+	b, _ := json.MarshalIndent(spec, "", "  ")
+	fmt.Printf("valid ✓\n%s\n", b)
+	return 0
+}
+
+// callPrint performs an RPC and pretty-prints the raw result when dst is nil.
+func callPrint(method string, params any, dst any) error {
+	raw, err := api.Call(method, params)
+	if err != nil {
+		return err
+	}
+	if dst != nil {
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return fmt.Errorf("decode %s result: %w", method, err)
+		}
+	}
+	return nil
 }
 
 func ttlLabel(t int) string {
@@ -511,7 +593,11 @@ func relaunchViaSudo() {
 	if err != nil {
 		fatal(fmt.Errorf("need root (sudo): %v", err))
 	}
-	argv := append([]string{"sudo", exe}, os.Args[1:]...)
+	sudo, err := exec.LookPath("sudo")
+	if err != nil {
+		fatal(fmt.Errorf("need root (sudo): %v", err))
+	}
+	argv := append([]string{sudo, exe}, os.Args[1:]...)
 	// #nosec G204 — argv is our own executable with user subcommand args.
 	if err := syscallExec(argv[0], argv, os.Environ()); err != nil {
 		fatal(fmt.Errorf("need root (sudo): %v", err))

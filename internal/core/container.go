@@ -23,6 +23,8 @@ type Container struct {
 	Expired        bool       `json:"expired"`
 	ShadowSize     int64      `json:"shadow_size"`
 	ShadowUsed     int64      `json:"shadow_used"`
+	DiskUsed       int64      `json:"disk_used"`
+	DiskMax        int64      `json:"disk_max"` // 0 = unlimited
 }
 
 type meta struct {
@@ -169,6 +171,11 @@ func Create(name string, spec *Spec) (*Container, error) {
 	ensurePrimed(name)
 	attachMu.Unlock()
 
+	// disk quota gate (resources.disk_max_bytes)
+	if err := CheckDiskQuota(name, spec); err != nil {
+		_ = Destroy(name)
+		return nil, err
+	}
 	uid := 0
 	if spec.User == "nobody" {
 		if uid, err = nextUid(); err != nil {
@@ -340,6 +347,11 @@ func describe(m *meta) (*Container, error) {
 		c.ShadowSize = fi.Size()
 		c.ShadowUsed = FileAllocated(c.Shadow)
 	}
+	spec := m.effectiveSpec()
+	c.DiskUsed = diskFootprint(m.Name)
+	if spec.Resources.DiskMaxBytes != nil {
+		c.DiskMax = int64(*spec.Resources.DiskMaxBytes)
+	}
 	return c, nil
 }
 
@@ -393,15 +405,12 @@ type OnceResult struct {
 
 // Once runs a single command with one-shot lifecycle: create from the
 // template when missing, exec, destroy when rm is set.
-func Once(name, templateFile string, argv []string, opts ExecOptions, rm bool) (*OnceResult, error) {
+// Once runs a command in a container, creating it from spec if missing.
+func Once(name string, spec *Spec, argv []string, opts ExecOptions, rm bool) (*OnceResult, error) {
 	out := &OnceResult{Container: name}
 	if _, err := Describe(name); err != nil {
-		if templateFile == "" {
-			return nil, fmt.Errorf("container %q not found (deploy it or pass a template with -f)", name)
-		}
-		spec, perr := ParseTemplate(templateFile)
-		if perr != nil {
-			return nil, perr
+		if spec == nil {
+			return nil, fmt.Errorf("container %q not found (deploy it or pass a template)", name)
 		}
 		if _, cerr := Create(name, spec); cerr != nil {
 			return nil, cerr

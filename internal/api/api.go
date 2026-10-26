@@ -84,6 +84,17 @@ func (s *Server) bus(method string, params json.RawMessage) (any, error) {
 		defer s.mu.Unlock()
 		return core.Create(p.Name, spec)
 
+	case "container.bootstrap":
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("bad params: %w", err)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return core.Bootstrap(p.Name)
+
 	case "template.validate":
 		var p DeployParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -162,6 +173,7 @@ func (s *Server) bus(method string, params json.RawMessage) (any, error) {
 		var p struct {
 			Name      string            `json:"name"`
 			YAML      string            `json:"yaml,omitempty"`
+			Spec      *core.Spec        `json:"spec,omitempty"`
 			Command   []string          `json:"command"`
 			Cwd       string            `json:"cwd,omitempty"`
 			Env       map[string]string `json:"env,omitempty"`
@@ -175,8 +187,8 @@ func (s *Server) bus(method string, params json.RawMessage) (any, error) {
 		if len(p.Command) == 0 {
 			return nil, fmt.Errorf("command required")
 		}
-		file := ""
-		if p.YAML != "" {
+		spec := p.Spec
+		if spec == nil && p.YAML != "" {
 			tmp, err := os.CreateTemp("", "ctd-once-*.yaml")
 			if err != nil {
 				return nil, err
@@ -187,7 +199,10 @@ func (s *Server) bus(method string, params json.RawMessage) (any, error) {
 			}
 			tmp.Close()
 			defer os.Remove(tmp.Name())
-			file = tmp.Name()
+			spec, err = core.ParseTemplate(tmp.Name())
+			if err != nil {
+				return nil, err
+			}
 		}
 		opts := core.ExecOptions{Cwd: p.Cwd, Env: p.Env, Stdin: p.Stdin}
 		if p.TimeoutMs > 0 {
@@ -195,7 +210,7 @@ func (s *Server) bus(method string, params json.RawMessage) (any, error) {
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return core.Once(p.Name, file, p.Command, opts, p.Rm)
+		return core.Once(p.Name, spec, p.Command, opts, p.Rm)
 
 	case "container.gc":
 		s.mu.Lock()
@@ -397,18 +412,16 @@ func (s *Server) call(w http.ResponseWriter, method string, params json.RawMessa
 	writeJSON(w, 200, envelope{OK: true, Result: raw})
 }
 
-// ServeHTTP runs the HTTP JSON API on addr (e.g. "127.0.0.1:7399").
-func (s *Server) ServeHTTP(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+// Serve runs the HTTP JSON API on the given listener.
+func (s *Server) Serve(ln net.Listener) error {
+	if s.Token == "" {
+		s.Token = LoadToken()
 	}
-	fmt.Fprintf(os.Stderr, "ctd API listening on http://%s (token auth: %v)\n", addr, s.Token != "")
 	srv := &http.Server{Handler: s.Handler()}
 	return srv.Serve(ln)
 }
 
-// ---- stdio JSON-RPC (one request per line, one response per line) ----
+// ---- newline-delimited JSON-RPC ----
 
 type rpcRequest struct {
 	ID     string          `json:"id"`
@@ -421,44 +434,6 @@ type rpcResponse struct {
 	OK     bool            `json:"ok"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  string          `json:"error,omitempty"`
-}
-
-// ServeStdio processes newline-delimited JSON-RPC on r/w (stdin/stdout).
-// Used by other apps: ctd rpc  ⇢  {"id":"1","method":"container.list"}
-func (s *Server) ServeStdio(r io.Reader, w io.Writer) error {
-	dec := json.NewDecoder(r)
-	enc := json.NewEncoder(w)
-	for {
-		var req rpcRequest
-		if err := dec.Decode(&req); err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			// Try to continue on malformed lines.
-			if e, ok := err.(*json.SyntaxError); ok {
-				_ = enc.Encode(rpcResponse{OK: false, Error: "syntax error: " + e.Error()})
-				continue
-			}
-			return err
-		}
-		res, err := s.bus(req.Method, req.Params)
-		resp := rpcResponse{ID: req.ID, OK: true}
-		if err != nil {
-			resp.OK = false
-			resp.Error = err.Error()
-		} else {
-			raw, mErr := json.Marshal(res)
-			if mErr != nil {
-				resp.OK = false
-				resp.Error = mErr.Error()
-			} else {
-				resp.Result = raw
-			}
-		}
-		if err := enc.Encode(resp); err != nil {
-			return err
-		}
-	}
 }
 
 // NewToken generates a random auth token and persists it under OptDir.

@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,17 +29,19 @@ type ExecOptions struct {
 	Username string            // run as this user inside (default nobody)
 }
 
-// Exec runs a command inside a container: attach if needed, write a
-// deny-by-default Seatbelt profile, then sandbox-exec → chroot → rlimits →
-// privilege drop → exec. Source is "cli" or "api" for the audit log.
-func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, error) {
+// execShared is the single execution path used by Exec (captured) and
+// StreamExec (streaming): attach, TTL + disk gates, Seatbelt profile,
+// shares-in, prime, DNS bridge, sandbox-exec, wait (timeout/abort),
+// audit, shares-out.
+func execShared(source, name string, argv []string, opts ExecOptions,
+	stdin io.Reader, stdout, stderr io.Writer, abort <-chan struct{},
+	started func(pid int)) (*ExecResult, error) {
 	if len(argv) == 0 {
 		return nil, fmt.Errorf("no command given")
 	}
 	if err := Attach(name); err != nil {
 		return nil, err
 	}
-	// TTL enforcement
 	if c, err := Describe(name); err == nil && c.Expired {
 		return nil, fmt.Errorf("container %q expired", name)
 	}
@@ -52,6 +55,9 @@ func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, er
 	if spec.User == "root" {
 		uid = 0
 	}
+	if err := CheckDiskQuota(name, spec); err != nil {
+		return nil, err
+	}
 
 	self, err := os.Executable()
 	if err != nil {
@@ -61,21 +67,18 @@ func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, er
 	if err != nil {
 		return nil, err
 	}
-	// Path shares: sync host -> container before exec.
 	if serr := SyncShares(root, spec, cm.effectiveUid(), "in"); serr != nil {
 		return nil, fmt.Errorf("share sync in: %w", serr)
 	}
 	if signed := signShareExes(cm.Name, root, spec); len(signed) > 0 {
 		primePaths(filepath.Join(root, "private/tmp"), signed...)
 	}
-	// DNS bridge (network-enabled containers only).
 	release, berr := AcquireDNSBridge(root, spec)
 	if berr != nil {
 		return nil, berr
 	}
 	defer release()
 
-	// sandbox-exec -f profile ctd __inner --root R --uid U --cwd C -- cmd...
 	args := []string{"-f", profile, self, "__inner", "--root", root, "--uid", fmt.Sprintf("%d", uid)}
 	cwd := opts.Cwd
 	if cwd == "" {
@@ -103,21 +106,22 @@ func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, er
 		env[k] = v
 	}
 	cmd.Env = SanitizeEnv(spec.Home, cwd, env)
-	cmd.Stdin = strings.NewReader(opts.Stdin)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Own process group so timeouts kill the whole tree.
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start: %w", err)
 	}
-
-	var timedOut bool
+	if started != nil {
+		started(cmd.Process.Pid) // Setpgid: pid == pgid
+	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+
+	timedOut, aborted := false, false
 	var waitErr error
 	if opts.Timeout > 0 {
 		select {
@@ -126,114 +130,61 @@ func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, er
 			timedOut = true
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			waitErr = <-done
+		case <-abort:
+			aborted = true
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			waitErr = <-done
 		}
 	} else {
-		waitErr = <-done
+		select {
+		case waitErr = <-done:
+		case <-abort:
+			aborted = true
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			waitErr = <-done
+		}
 	}
 
 	exitCode := 0
-	if timedOut {
+	switch {
+	case timedOut:
 		exitCode = 124
-	} else if waitErr != nil {
+	case aborted:
+		exitCode = 130
+	case waitErr != nil:
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
 			return nil, waitErr
 		}
 	}
-	res := &ExecResult{
-		Stdout:     stdout.String(),
-		Stderr:     stderr.String(),
-		ExitCode:   exitCode,
-		DurationMs: time.Since(start).Milliseconds(),
-	}
-	extra := map[string]any{"timed_out": timedOut}
-	Audit(source, name, argv, exitCode, time.Since(start), extra)
-	// Path shares: sync container -> host after exec (rw only).
+	res := &ExecResult{ExitCode: exitCode, DurationMs: time.Since(start).Milliseconds()}
+	Audit(source, name, argv, exitCode, time.Since(start),
+		map[string]any{"timed_out": timedOut, "aborted": aborted})
 	if serr := SyncShares(root, spec, cm.effectiveUid(), "out"); serr != nil {
 		res.Stderr += "\n[ctd] share sync out: " + serr.Error() + "\n"
 	}
 	return res, nil
 }
 
-// ExecInteractive runs a command with inherited stdio (for `ctd shell` /
-// `ctd run` in a terminal). Returns the exit code.
-func ExecInteractive(source, name string, argv []string, opts ExecOptions) (int, error) {
-	if err := Attach(name); err != nil {
-		return 1, err
-	}
-	if c, err := Describe(name); err == nil && c.Expired {
-		return 1, fmt.Errorf("container %q expired", name)
-	}
-	root := Root(name)
-	cm, merr := LoadMeta(name)
-	if merr != nil {
-		cm = &meta{}
-	}
-	spec := cm.effectiveSpec()
-	uid := cm.effectiveUid()
-	if spec.User == "root" {
-		uid = 0
-	}
-	self, err := os.Executable()
+// Exec runs a command captured (stdout/stderr collected).
+func Exec(source, name string, argv []string, opts ExecOptions) (*ExecResult, error) {
+	var stdout, stderr strings.Builder
+	res, err := execShared(source, name, argv, opts, strings.NewReader(opts.Stdin), &stdout, &stderr, nil, nil)
 	if err != nil {
-		return 1, err
+		return nil, err
 	}
-	profile, err := WriteProfile(root, self, spec)
-	if err != nil {
-		return 1, err
-	}
-	if serr := SyncShares(root, spec, cm.effectiveUid(), "in"); serr != nil {
-		return 1, fmt.Errorf("share sync in: %w", serr)
-	}
-	if signed := signShareExes(cm.Name, root, spec); len(signed) > 0 {
-		primePaths(filepath.Join(root, "private/tmp"), signed...)
-	}
-	release, berr := AcquireDNSBridge(root, spec)
-	if berr != nil {
-		return 1, berr
-	}
-	defer release()
-	args := []string{"-f", profile, self, "__inner", "--root", root, "--uid", fmt.Sprintf("%d", uid)}
-	cwd := opts.Cwd
-	if cwd == "" {
-		cwd = spec.Workdir
-	}
-	if cwd != "" {
-		args = append(args, "--cwd", cwd)
-	}
-	if opts.Username != "" {
-		args = append(args, "--user", opts.Username)
-	}
-	for k, v := range spec.Rlimits() {
-		args = append(args, "--rlimit", fmt.Sprintf("%s=%d", k, v))
-	}
-	args = append(args, "--")
-	args = append(args, argv...)
+	res.Stdout = stdout.String()
+	res.Stderr = stderr.String()
+	return res, nil
+}
 
-	cmd := exec.Command("sandbox-exec", args...)
-	env := spec.Env
-	for k, v := range opts.Env {
-		env[k] = v
-	}
-	cmd.Env = SanitizeEnv(spec.Home, cwd, env)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	start := time.Now()
-	err = cmd.Run()
-	exitCode := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			return 1, err
-		}
-	}
-	Audit(source, name, argv, exitCode, time.Since(start), nil)
-	_ = SyncShares(root, spec, cm.effectiveUid(), "out") // best-effort for interactive
-	return exitCode, nil
+// StreamExec runs a command with caller-supplied streams (daemon streaming)
+// and an abort channel that kills the tree on client disconnect.
+func StreamExec(source, name string, argv []string, opts ExecOptions,
+	stdin io.Reader, stdout, stderr io.Writer, abort <-chan struct{},
+	started func(pid int)) (*ExecResult, error) {
+	return execShared(source, name, argv, opts, stdin, stdout, stderr, abort, started)
 }
 
 // Inner is the privileged in-sandbox stage: chroot, rlimits, privdrop, exec.
